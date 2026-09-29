@@ -1,0 +1,172 @@
+# ==========================================================================
+#  FaceGate — система распознавания лиц с голосовым приветствием
+# ==========================================================================
+#  Все настройки вынесены в переменные окружения: скопируйте .env.example
+#  в .env и заполните — файл .env docker compose подхватывает автоматически.
+#
+#  Быстрый старт (сервер + панель на этом же хосте):
+#      docker compose up -d server
+#      → админ-панель: http://localhost:8080  (admin / admin — смените пароль!)
+#
+#  Сервер + клиент с камерой на этом же хосте:
+#      docker compose --profile client up -d client
+#      (камера и звуковой выход определяются клиентом АВТОМАТИЧЕСКИ)
+#
+#  Клиент, подключённый к СТОРОННЕМУ серверу (сервер здесь не нужен):
+#      в .env:  SERVER_HOST=<ip-или-домен-стороннего-сервера>
+#      docker compose --profile client up -d client
+#
+#  Сеть: сервисы общаются через выделенную bridge-сеть `face-net` по именам
+#  (клиент → server:5555/5556). Наружу публикуются только порты сервера —
+#  к ним подключаются клиенты с ДРУГИХ машин ( docker-сеть им не видна ).
+#
+#  Права: сервер стартует от root, но entrypoint делает владельцем данных
+#  ${PUID}:${PGID} и сбрасывает привилегии — сохранённые звуки/снимки/настройки
+#  принадлежат вашему пользователю, а не root. Клиент сразу работает от
+#  ${PUID}:${PGID}, доступ к камере и звуку дают группы video/audio (group_add)
+#  и device_cgroup_rules.
+# ==========================================================================
+
+name: facegate
+
+networks:
+  face-net:
+    driver: bridge
+    # Фиксированная подсеть — только если сеть конфликтует с вашей инфраструктурой:
+    # ipam:
+    #   config:
+    #     - subnet: 172.28.40.0/24
+
+services:
+  # --------------------------------------------------------------------------
+  # СЕРВЕР: распознавание лиц, TTS (Silero — внутри контейнера), админ-панель
+  # --------------------------------------------------------------------------
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    image: facegate-server:latest
+    container_name: facegate-server
+    networks:
+      - face-net
+    ports:
+      # Админ-панель (веб-интерфейс)
+      - "${WEB_PORT:-8080}:8080"
+      # ZMQ-порты нужны только для клиентов с ДРУГИХ машин.
+      # Если все клиенты в этой же compose-сети — публикацию можно убрать.
+      - "${VIDEO_PORT:-5555}:5555"     # приём видео (PULL)
+      - "${COMMAND_PORT:-5556}:5556"   # команды/озвучка клиентам (PUB)
+    environment:
+      # Учётные данные админ-панели. ОБЯЗАТЕЛЬНО поменяйте для «боевого» запуска!
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      # Ключ сессий (если не задан — генерируется и сохраняется в admin_data/)
+      ADMIN_SECRET_KEY: ${ADMIN_SECRET_KEY:-}
+      # Озвучка: silero = нейросетевой русский голос (установлен в образе).
+      # Голоса silero: aidar, baya, kseniya, eugene, xenia.
+      TTS_ENGINE: ${TTS_ENGINE:-silero}
+      TTS_VOICE: ${TTS_VOICE:-baya}
+      TTS_SPEED: ${TTS_SPEED:-}
+      # Ограничение нативных потоков: защита от дедлока OpenMP в dlib и от
+      # «съедания» всех ядер синтезом озвучки (см. Dockerfile.server)
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+      SILERO_THREADS: ${SILERO_THREADS:-2}
+      SILERO_SAMPLE_RATE: ${SILERO_SAMPLE_RATE:-48000}
+      FACEGATE_INFERENCE_TIMEOUT: ${FACEGATE_INFERENCE_TIMEOUT:-30}
+      # От какого пользователя хранить файлы в томах (id -u / id -g на хосте).
+      # Entrypoint сделает chown каталогов данных и сбросит привилегии процесса.
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Europe/Moscow}
+    volumes:
+      # Данные переживают пересоздание контейнера. Каталог soundboard/ — звуки
+      # для вкладки «Саундборд» (можно просто класть туда WAV-файлы на хосте).
+      - ./known_faces:/app/known_faces     # эталоны лиц
+      - ./voice_cache:/app/voice_cache     # кэш озвучки + индекс для саундборда
+      - ./admin_data:/app/admin_data       # пароли панели, ключ сессий, настройки
+      - ./debug_frames:/app/debug_frames   # снимки с разметкой
+      - ./soundboard:/app/soundboard       # загруженные звуки
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # КЛИЕНТ: камера + динамик (профиль `client` — запускается только по желанию)
+  # --------------------------------------------------------------------------
+  #  Камера определяется автоматически (CAMERA_ID=auto): клиент перебирает
+  #  все /dev/video* хоста и берёт первый реально работающий узел — не важно,
+  #  video0 это или video3. Доступ без root дают:
+  #    * device_cgroup_rules — разрешение на классы устройств V4L2 (81) и ALSA (116);
+  #    * том /dev:/dev — устройства хоста видны внутри контейнера;
+  #    * group_add video,audio — файловые права на /dev/video* и /dev/snd/*.
+  #
+  #  Звук — тоже автоматически: если PulseAudio-сокет хоста проброшен и жив,
+  #  играет paplay; иначе клиент переходит на ALSA (aplay) через /dev/snd.
+  #
+  #  Куда подключается клиент — SERVER_HOST:
+  #    * server          → сервер из этого же compose-файла (сеть face-net);
+  #    * 192.168.1.50    → сторонний сервер в локальной сети;
+  #    * face.example.ru → сервер в интернете (порты 5555/5556 должны быть открыты).
+  # --------------------------------------------------------------------------
+  client:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.client
+    image: facegate-client:latest
+    container_name: facegate-client
+    profiles: ["client"]
+    networks:
+      - face-net
+    environment:
+      SERVER_HOST: ${SERVER_HOST:-server}
+      # Порт, на котором сервер СЛУШАЕТ клиентов:
+      #  * локальный сценарий (SERVER_HOST=server) — внутренний порт контейнера,
+      #    он всегда 5555/5556 (публикация на хост в ports: может быть другой);
+      #  * сторонний сервер — тот порт, который опубликован на нём.
+      SERVER_VIDEO_PORT: ${SERVER_VIDEO_PORT:-5555}
+      SERVER_COMMAND_PORT: ${SERVER_COMMAND_PORT:-5556}
+      # auto — первая работающая камера; можно указать индекс (0) или путь (/dev/video2)
+      CAMERA_ID: ${CAMERA_ID:-auto}
+      CLIENT_ID: ${CLIENT_ID:-cam-1}
+      # Звук хоста через PulseAudio (если сокет есть); иначе клиент сам
+      # переключится на ALSA (/dev/snd проброшен через /dev:/dev + cgroup-правило)
+      PULSE_SERVER: unix:/tmp/pulse/native
+      # Клиент приводит любой WAV к этой частоте (48 кГц играют все карты;
+      # 24 кГц от Silero без передискретизации звучали вдвое быстрее)
+      AUDIO_TARGET_RATE: ${AUDIO_TARGET_RATE:-48000}
+      AUDIO_PAD_MS: ${AUDIO_PAD_MS:-150}
+      TZ: ${TZ:-Europe/Moscow}
+    command: >
+      python client.py
+      --no-debug
+      --max-width ${MAX_WIDTH:-1280}
+      --fps ${CLIENT_FPS:-10}
+    # Разрешаем классы устройств: 81 = V4L2 (/dev/video*), 116 = ALSA (/dev/snd/*).
+    # Вместе с томом /dev:/dev это даёт автопоиск любой камеры хоста без
+    # перечисления конкретных /dev/videoN (и compose не падает, если их нет).
+    device_cgroup_rules:
+      - "c 81:* rmw"
+      - "c 116:* rmw"
+    volumes:
+      - /dev:/dev
+      # Каталог PulseAudio вашего пользователя (обычно /run/user/1000/pulse).
+      # Если его нет на хосте — ничего страшного: клиент сыграет через ALSA.
+      - ${PULSE_DIR:-/run/user/1000/pulse}:/tmp/pulse:ro
+    # Файловые права на /dev/video* (группа video) и /dev/snd* (группа audio).
+    # Имена резолвятся в GID из /etc/group хоста; числа — через VIDEO_GID/AUDIO_GID
+    # (getent group video | cut -d: -f3).
+    group_add:
+      - "${VIDEO_GID:-video}"
+      - "${AUDIO_GID:-audio}"
+    # Обычный пользователь хоста (тот же, что владеет PulseAudio-сокетом):
+    # PUID=$(id -u) PGID=$(id -g).
+    user: "${PUID:-1000}:${PGID:-1000}"
+    restart: unless-stopped
+    # Намеренно БЕЗ depends_on: клиент может работать и со сторонним сервером
+    # (SERVER_HOST=...), когда локальный сервер вообще не нужен.
+    # Порядок запуска для локального сценария: сначала `up -d server`, потом клиент.

@@ -1,0 +1,91 @@
+# ==========================================================================
+#  Образ СЕРВЕРА распознавания лиц (headless) + админ-панель + TTS в контейнере
+# ==========================================================================
+#  Озвучка — Silero TTS (нейросетевой русский голос): torch и модель v5_ru
+#  устанавливаются и запекаются в образ при сборке, поэтому синтез речи
+#  работает внутри контейнера БЕЗ espeak-«акцента» и без сети в рантайме.
+#  espeak-ng остаётся в образе как лёгкий запасной движок.
+#
+#  Файлы в томах (озвучка, звуки, снимки, настройки) сохраняются от имени
+#  ${PUID}:${PGID} (по умолчанию 1000:1000), а не от root — этим занимается
+#  docker/server-entrypoint.py (chown каталогов + сброс привилегий).
+#
+#  Сборка (из корня проекта):
+#      docker compose build server
+# ==========================================================================
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    # движок озвучки по умолчанию (переопределяется в .env / настройках панели)
+    TTS_ENGINE=silero \
+    # Один поток OpenMP/MKL для dlib: параллельный рантайм внутри dlib при
+    # вызовах из нескольких потоков Python (распознавание + веб-панель) —
+    # типовая причина полного зависания процесса. Все вызовы dlib в коде
+    # дополнительно сериализованы глобальной блокировкой инференса.
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    # Синтез озвучки не должен съедать все ядра (нужны распознаванию и ZeroMQ)
+    SILERO_THREADS=2 \
+    # Сколько секунд HTTP-запрос панели готов ждать движок распознавания
+    FACEGATE_INFERENCE_TIMEOUT=30 \
+    # Частота WAV, который уходит клиентам (48 кГц играют все звуковые карты)
+    SILERO_SAMPLE_RATE=48000
+
+# Runtime-библиотеки:
+#   libgl1, libglib2.0-0 — OpenCV;
+#   espeak-ng            — запасной TTS-движок;
+#   ffmpeg               — конвертация звуков саундборда (mp3/ogg → WAV) для клиентов.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 \
+        espeak-ng \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt requirements-prebuilt.txt ./
+
+# 1) Silero TTS: torch (только CPU-колесо, без CUDA — образ в разы меньше)
+#    + официальный пакет silero + scipy (нужен для загрузки v5-модели).
+#    Модель v5_ru скачивается один раз при сборке и запекается в слой образа
+#    (site-packages/silero/model + /app/latest_silero_models.yml) —
+#    в рантайме интернет не нужен.
+RUN pip install --force-reinstall "setuptools<70" wheel && \
+    pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio && \
+    pip install "silero>=0.5" scipy && \
+    python -c "from silero import silero_tts; m, _ = silero_tts(language='ru', speaker='v5_ru'); \
+m.save_wav(text='Озвучка готова к работе.', speaker='baya', audio_path='/tmp/warmup.wav', sample_rate=48000); \
+print('silero v5_ru model baked into image')"
+
+# 2) Остальные зависимости. opencv-python заменяется headless-сборкой
+#    (сервер окон не открывает — всё видео показывается в админ-панели).
+#    dlib ставится готовым колесом (dlib-bin) — без cmake и компилятора.
+RUN grep -viE '^opencv-python([^-]|$)' requirements-prebuilt.txt > /tmp/reqs.txt && \
+    pip install -r /tmp/reqs.txt "opencv-python-headless>=4.5.0" && \
+    pip install --no-deps "face_recognition>=1.3.0" && \
+    python -c "import cv2, dlib, face_recognition, face_recognition_models, flask, zmq, silero, scipy, torch; print('deps ok')"
+
+# 3) Код (данные — known_faces/, voice_cache/, admin_data/, debug_frames/,
+#    soundboard/ — подключаются томами и в образ не копируются)
+COPY facegate/ ./facegate/
+COPY server.py client.py pytest.ini ./
+COPY docker/server-entrypoint.py ./docker/
+COPY tools/ ./tools/
+COPY tests/ ./tests/
+RUN python -c "import facegate; print('facegate', facegate.VERSION)" && \
+    python -c "from facegate.tts.engines import get_engine; e = get_engine('silero'); \
+assert e is not None and e.available(), 'silero engine unavailable'; print('tts engine ok')"
+
+# 5555 — приём видео (ZMQ PULL), 5556 — команды (ZMQ PUB), 8080 — админ-панель
+EXPOSE 5555 5556 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=5 --start-period=30s \
+    CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3).status==200 else 1)"]
+
+# Entrypoint: chown каталогов данных в ${PUID}:${PGID} и сброс привилегий,
+# затем запуск CMD (server.py). TTS_ENGINE/TTS_VOICE подхватываются из окружения.
+ENTRYPOINT ["python", "-u", "docker/server-entrypoint.py"]
+CMD ["python", "-u", "server.py"]

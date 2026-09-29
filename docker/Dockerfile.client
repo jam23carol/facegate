@@ -1,0 +1,44 @@
+# ==========================================================================
+#  Образ КЛИЕНТА: захват камеры + воспроизведение приветствий
+# ==========================================================================
+#  Клиент — один автономный файл client.py (opencv + pyzmq + numpy).
+#  Работает НЕ от root: доступ к /dev/video* даёт группа `video` хоста —
+#  она добавляется контейнеру через group_add в docker-compose.yml
+#  (переменная VIDEO_GID, по умолчанию имя группы `video`).
+#
+#  Сборка (из корня проекта):
+#      docker compose build client
+# ==========================================================================
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Плееры: paplay (pulseaudio-utils) и aplay (alsa-utils) — их ищет client.py.
+# Если клиенту нужно окно предпросмотра (запуск без --no-debug), добавьте
+# X11-проброс на хосте и замените opencv-python-headless на opencv-python.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 \
+        alsa-utils pulseaudio-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+RUN pip install --force-reinstall "setuptools<70" wheel && \
+    pip install \
+        "opencv-python-headless>=4.5.0" \
+        "pyzmq>=22.0.0" \
+        "numpy>=1.24,<3"
+
+COPY client.py .
+
+# Непривилегированный пользователь по умолчанию (compose может переопределить
+# user: ${PUID}:${PGID}). Группа video добавляется через group_add в compose —
+# её GID на хосте может отличаться (44, 985, ...), поэтому в образ её не зашиваем.
+RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin client
+USER client
+
+# Адрес сервера клиент берёт из SERVER_HOST/SERVER_VIDEO_PORT/SERVER_COMMAND_PORT
+# (см. docker-compose.yml и .env.example): по умолчанию — сервис `server`
+# в общей docker-сети; для стороннего сервера укажите его IP/домен в .env.
+CMD ["python", "client.py", "--no-debug"]

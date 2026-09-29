@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "users": {
+    "admin": {
+      "salt": "e71bbada78ffca52ac7ef768a2cc36b7",
+      "hash": "00770b3beccb5a5ec7b34bef27ac3d55104999760ae6b6b57d2a7886cdc18625",
+      "iterations": 200000,
+      "algo": "pbkdf2_sha256",
+      "created": 1790591717.1084805,
+      "updated": 1790591717.1084805,
+      "must_change": true
+    }
+  }
+}

@@ -1,0 +1,47 @@
+# ==========================================================================
+#  Зависимости БЕЗ компиляции dlib (предкомпилированные колёса)
+# ==========================================================================
+#  Вместо dlib (сборка из исходников: cmake + C++-компилятор, 5–15 минут)
+#  используется dlib-bin — готовые бинарные колёса для:
+#      Linux x86_64/aarch64 (glibc и musl), Windows amd64, macOS arm64/x86_64,
+#      Python 3.10 – 3.14.
+#
+#  Установка (рекомендуется скриптом):
+#      ./install.sh --prebuilt          (Linux/macOS)
+#      install.bat --prebuilt           (Windows)
+#
+#  Вручную — три команды, порядок важен:
+#      python -m pip install --force-reinstall "setuptools<70"
+#      python -m pip install -r requirements-prebuilt.txt
+#      python -m pip install --no-deps "face_recognition>=1.3.0"
+#
+#  Почему --no-deps: пакет face_recognition объявляет зависимость `dlib`,
+#  а dlib-bin предоставляет модуль dlib под другим именем дистрибутива.
+#  Без --no-deps pip начал бы собирать dlib из исходников.
+#
+#  Нейросетевая русская озвучка (как в Docker) ставится отдельно:
+#      ./install.sh --tts
+# ==========================================================================
+
+setuptools<70
+wheel>=0.42
+
+numpy>=1.24,<3
+Pillow>=9.0
+click>=8.0
+
+opencv-python>=4.5.0
+pyzmq>=22.0.0
+flask>=2.2.0
+pyttsx3>=2.90
+
+# веса моделей распознавания (≈100 МБ) — ставятся до face_recognition
+face_recognition_models>=0.3.0
+
+# предкомпилированный dlib (модуль импортируется как `import dlib`)
+dlib-bin>=19.24
+
+# сам face_recognition ставится отдельно:
+#   python -m pip install --no-deps "face_recognition>=1.3.0"
+
+pytest>=7.0
