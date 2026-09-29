@@ -8,48 +8,63 @@
 
 Окно с камерой на клиенте остаётся (это машина с монитором), а сервер никаких
 окон не открывает — видео целиком видно в админ-панели:
-    http://<адрес сервера>:8080
+``http://<адрес сервера>:8080``
 
 Кадр уходит в ZeroMQ PUSH как multipart:
-    [client_id, jpeg]              — обычный кадр
-    [client_id, jpeg, meta_json]   — раз в --meta-interval секунд добавляются
-                                     метаданные (хост, камера, разрешение, версия),
-                                     они показываются в панели на карточке камеры.
+``[client_id, jpeg]``              — обычный кадр
+``[client_id, jpeg, meta_json]``   — раз в --meta-interval секунд добавляются
+метаданные (хост, камера, разрешение, версия),
+они показываются в панели на карточке камеры.
 
 Подключение к серверу — аргументами или переменными окружения (удобно в Docker):
-    --server-ip    / SERVER_HOST           (по умолчанию 127.0.0.1)
-    --video-port   / SERVER_VIDEO_PORT     (по умолчанию 5555)
-    --command-port / SERVER_COMMAND_PORT   (по умолчанию 5556)
-    --camera-id    / CAMERA_ID             (по умолчанию auto — первая работающая)
-    --client-id    / CLIENT_ID             (по умолчанию hostname)
+--server-ip    / SERVER_HOST           (по умолчанию 127.0.0.1)
+--video-port   / SERVER_VIDEO_PORT     (по умолчанию 5555)
+--command-port / SERVER_COMMAND_PORT   (по умолчанию 5556)
+--camera-id    / CAMERA_ID             (по умолчанию auto — первая работающая)
+--camera-device / CAMERA_DEVICE        (приоритетнее --camera-id; удобно в Docker)
+--client-id    / CLIENT_ID             (по умолчанию hostname)
 
-Камера определяется АВТОМАТИЧЕСКИ: клиент перебирает /dev/video* (многие камеры
+Камера определяется автоматически: клиент перебирает /dev/video* (многие камеры
 создают несколько узлов, где video0 — не всегда захват), затем индексы 0..9 —
 и берёт первое устройство, которое реально читает кадры.
 
-Звук (исправлено в этой версии)
-------------------------------
-* **Windows работает из коробки**: воспроизведение через ``winsound``
-  (встроен в Python), запасные варианты — PowerShell ``Media.SoundPlayer``,
-  ``ffplay``/``mpv``/``vlc`` из PATH. Раньше в списке плееров были только
-  Linux-утилиты, ``resolve_player()`` возвращал None и клиент молчал.
-* **Нет «ускоренной» озвучки и обрезанной концовки**: входящий WAV приводится
-  к 16 бит / моно / 48 кГц (:func:`normalize_wav`). Silero TTS отдаёт 24 кГц,
-  а большинство звуковых карт ALSA/DirectSound играют 44.1/48 кГц: без
-  передискретизации aplay либо падал с «Rate 24000Hz not supported», либо
-  играл поток вдвое быстрее (фраза звучала наполовину). В конец добавляется
-  тишина — плееры больше не «съедают» последний слог.
-* **Очередь воспроизведения**: звуки играются последовательно в одном потоке и
-  не обрывают друг друга (``--audio-interrupt`` включает прерывание). Одинаковые
-  пакеты в коротком окне отбрасываются (дедупликация).
-* **Ошибки плеера видны**: вывод stderr больше не подавляется — при неудаче
-  клиент логирует причину и пробует следующий плеер.
+**Камера в Docker на хосте с Windows**
+---------------------------------------
+В Docker Desktop (WSL2 backend) USB-камеры не пробрасываются в контейнер
+автоматически. Чтобы камера появилась как /dev/video* внутри контейнера:
+
+1. Установите ``usbipd-win`` на хосте (один раз)::
+
+       winget install usbipd
+
+2. Найдите камеру в списке::
+
+       usbipd list
+
+3. Привяжите камеру к WSL2::
+
+       usbipd attach --wsl --busid <busid-камеры>
+
+4. Проверьте, что камера видна в контейнере::
+
+       docker compose --profile client exec client ls /dev/video*
+
+5. Перезапустите клиент::
+
+       docker compose --profile client up -d client
+
+Альтернатива — запуск клиента **нативно** на хосте с Windows (вне Docker)::
+
+    run-client.bat --server-ip <IP-сервера>
+
+В этом случае камера доступна напрямую через DirectShow/MSMF без проброса.
 
 Примеры:
     python client.py --server-ip 192.168.1.10            # сторонний сервер в сети
     SERVER_HOST=face.example.com python client.py        # то же через env
     python client.py --list-cameras                      # какие камеры доступны
     python client.py --camera-id /dev/video2             # конкретное устройство
+    CAMERA_DEVICE=/dev/video0 python client.py           # то же через env (Docker)
     python client.py --no-audio                          # без озвучки
 """
 import argparse
@@ -84,7 +99,7 @@ except ImportError:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-CLIENT_VERSION = "2.3.0"
+CLIENT_VERSION = "2.3.1"
 
 # ---------- АУДИО: параметры ----------
 #: Целевая частота дискретизации. 48 кГц аппаратно поддерживается почти всеми
@@ -178,6 +193,11 @@ def parse_args(argv=None):
                         help="Камера: 'auto' — найти первую работающую автоматически "
                              "(/dev/video*, затем индексы 0..9), либо индекс (0, 1, ...) "
                              "или путь устройства (/dev/video2) (env: CAMERA_ID)")
+    parser.add_argument("--camera-device", type=str,
+                        default=_env("CAMERA_DEVICE"),
+                        help="Путь к устройству камеры (приоритетнее --camera-id). "
+                             "Удобно в Docker: CAMERA_DEVICE=/dev/video0. "
+                             "Если задано — автопоиск не выполняется (env: CAMERA_DEVICE)")
     parser.add_argument("--video-source", type=str, default=_env("VIDEO_SOURCE"),
                         help="Источник видео вместо камеры: путь к файлу или RTSP/HTTP URL")
     parser.add_argument("--fps", type=int, default=10, help="Кадров в секунду для отправки")
@@ -217,6 +237,7 @@ def parse_args(argv=None):
 
 
 # ---------- АУДИО: доступность выходов ----------
+
 def pulse_socket_path():
     """Путь к сокету PulseAudio/PipeWire (если задан/угадывается)."""
     srv = os.environ.get("PULSE_SERVER", "")
@@ -243,13 +264,7 @@ def alsa_available():
 
 
 def native_player():
-    """Встроенный (не из PATH) способ воспроизвести WAV, либо None.
-
-    В Windows такой способ есть всегда — модуль ``winsound`` входит в стандартную
-    библиотеку Python и играет PCM WAV напрямую через звуковую карту. Именно
-    его отсутствие в списке плееров приводило к «Не найден аудиоплеер» и полной
-    немоте клиента на Windows.
-    """
+    """Встроенный (не из PATH) способ воспроизвести WAV, либо None."""
     if sys.platform != "win32":
         return None
     try:
@@ -269,12 +284,7 @@ def _usable(candidate):
 
 
 def player_candidates(player_cmd=None):
-    """Все **доступные** плееры по порядку предпочтения (для перебора при сбоях).
-
-    Порядок: явно указанный ``--audio-player`` → встроенный плеер платформы
-    (Windows: winsound) → живой PulseAudio-сокет → ALSA → список платформы.
-    Пустой список = играть нечем (тогда в лог пишется подсказка, что поставить).
-    """
+    """Все **доступные** плееры по порядку предпочтения (для перебора при сбоях)."""
     ordered = []
 
     def add(candidate):
@@ -298,15 +308,7 @@ def player_candidates(player_cmd=None):
 
 
 def resolve_player(player_cmd=None):
-    """Возвращает список аргументов первого подходящего плеера либо None.
-
-    Порядок выбора — автоматический, под окружение:
-      * явно указанный ``--audio-player``;
-      * Windows → winsound (встроен в Python);
-      * есть живой сокет PulseAudio → paplay;
-      * есть /dev/snd → aplay (ALSA);
-      * далее общий список платформы (:func:`platform_players`).
-    """
+    """Возвращает список аргументов первого подходящего плеера либо None."""
     candidates = player_candidates(player_cmd)
     return candidates[0] if candidates else None
 
@@ -325,6 +327,7 @@ def player_hint():
 
 
 # ---------- АУДИО: нормализация WAV ----------
+
 def _wav_to_float(raw, params):
     """PCM-байты WAV → float32-массив в диапазоне [-1, 1] (моно)."""
     if np is None:  # pragma: no cover - numpy идёт вместе с opencv
@@ -367,16 +370,7 @@ def _resample(samples, src_rate, dst_rate):
 
 def normalize_wav(data, target_rate=TARGET_SAMPLE_RATE, pad_ms=TRAILING_PAD_MS,
                   quiet_boost=True):
-    """Приводит WAV к формату, который реально играет системный плеер.
-
-    На выходе всегда **16 бит, моно, ``target_rate`` Гц** + тишина в конце.
-    Возвращает ``(bytes, info)``, где ``info`` — словарь с параметрами
-    (``rate``, ``seconds``, ``converted``, ``error``).
-
-    Зачем: Silero TTS отдаёт 24 кГц, а звуковые карты играют 44.1/48 кГц.
-    aplay без передискретизации либо падает («Rate 24000Hz not supported»),
-    либо выводит поток вдвое быстрее — фраза звучит «бурундуком» и вдвое короче.
-    """
+    """Приводит WAV к формату, который реально играет системный плеер."""
     info = {"rate": None, "seconds": 0.0, "converted": False, "error": None}
     if not data:
         info["error"] = "пустые аудио-данные"
@@ -386,37 +380,29 @@ def normalize_wav(data, target_rate=TARGET_SAMPLE_RATE, pad_ms=TRAILING_PAD_MS,
             params = w.getparams()
             raw = w.readframes(w.getnframes())
     except (wave.Error, EOFError, ValueError) as e:
-        # не-WAV (например, mp3 с саундборда без ffmpeg на сервере) — играем как есть
         info["error"] = f"не удалось разобрать WAV ({e})"
         return data, info
     if np is None:  # pragma: no cover
         info["error"] = "numpy недоступен — WAV отправлен без нормализации"
         return data, info
-
     samples, src_rate = _wav_to_float(raw, params)
     if samples is None or samples.size == 0:
         info["error"] = "в WAV нет аудиоданных"
         return data, info
     info["rate"] = int(src_rate)
-
     dst_rate = int(target_rate or TARGET_SAMPLE_RATE)
     samples = _resample(samples, src_rate, dst_rate)
     if src_rate != dst_rate:
         info["converted"] = True
-
     if quiet_boost:
         peak = float(np.max(np.abs(samples))) if samples.size else 0.0
         if 0 < peak < QUIET_PEAK:
-            # поднимаем очень тихую озвучку, но не более чем в MAX_BOOST раз —
-            # иначе вместе с сигналом усиливается шум квантования
             gain = min(QUIET_TARGET / peak, MAX_BOOST)
             samples = np.clip(samples * gain, -1.0, 1.0).astype(np.float32)
             info["boosted"] = round(gain, 2)
-
     lead = np.zeros(int(dst_rate * LEADING_PAD_MS / 1000.0), dtype=np.float32)
     tail = np.zeros(int(dst_rate * max(0, pad_ms) / 1000.0), dtype=np.float32)
     samples = np.concatenate([lead, samples.astype(np.float32), tail])
-
     pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2")
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -445,6 +431,7 @@ def test_tone_wav(seconds=0.6, rate=TARGET_SAMPLE_RATE, freq=440.0):
 
 
 # ---------- АУДИО: очередь воспроизведения ----------
+
 class PlaybackItem:
     __slots__ = ("data", "started", "finished", "result", "message", "digest",
                  "created")
@@ -460,13 +447,7 @@ class PlaybackItem:
 
 
 class AudioPlayer:
-    """Последовательное воспроизведение в одном потоке.
-
-    Зачем очередь: ``subprocess.Popen`` без ожидания приводил к тому, что вторая
-    команда либо аппаратно вытесняла первую, либо (в Windows) ``SND_ASYNC``
-    мгновенно обрывала текущий звук — фразы звучали «наполовину». Здесь звук
-    доигрывается до конца, а следующие команды ждут в очереди.
-    """
+    """Последовательное воспроизведение в одном потоке."""
 
     def __init__(self, player_cmd=None, target_rate=TARGET_SAMPLE_RATE,
                  interrupt=False, dedupe=DEDUPE_WINDOW, max_queue=MAX_QUEUE,
@@ -486,6 +467,7 @@ class AudioPlayer:
         self.stats = {"played": 0, "failed": 0, "skipped": 0, "dropped": 0}
 
     # ----- публичное -----
+
     def start(self):
         with self._lock:
             if self._thread is None or not self._thread.is_alive():
@@ -505,7 +487,6 @@ class AudioPlayer:
             self._log("Повтор того же звука в течение %.1f с — пропущен", self.dedupe)
             return True
         if self.interrupt:
-            # --audio-interrupt: новая команда прерывает текущую озвучку
             self.stop_all()
         try:
             self._queue.put_nowait(item)
@@ -514,9 +495,6 @@ class AudioPlayer:
             log.warning("Очередь воспроизведения переполнена (%d) — звук отброшен",
                         self.max_queue)
             return False
-        # Ждём только НАЧАЛА воспроизведения: сам проигрыш идёт в фоне и не
-        # блокирует поток приёма команд (иначе длинная фраза задержала бы
-        # следующие команды сервера).
         item.started.wait(timeout=max(0.1, float(wait)))
         if item.finished.is_set():
             return bool(item.result)
@@ -531,8 +509,8 @@ class AudioPlayer:
                 except queue.Empty:
                     break
             proc = self._proc
-        if proc is not None:
-            self._kill(proc)
+            if proc is not None:
+                self._kill(proc)
 
     def describe(self):
         player = resolve_player(self.player_cmd)
@@ -544,6 +522,7 @@ class AudioPlayer:
         }
 
     # ----- внутреннее -----
+
     def _log(self, message, *args):
         if not self.quiet:
             log.info(message, *args)
@@ -558,7 +537,7 @@ class AudioPlayer:
                     self._played.pop(key, None)
             last = self._played.get(item.digest)
             self._played[item.digest] = now
-        return bool(last and (now - last) <= self.dedupe)
+            return bool(last and (now - last) <= self.dedupe)
 
     def _loop(self):
         while True:
@@ -641,8 +620,6 @@ class AudioPlayer:
             return False, "не найден в PATH"
         cmd = list(candidate)
         if name == "aplay":
-            # явный формат: на многих картах aplay отказывается играть «сырой»
-            # поток без указания параметров, а ошибки раньше подавлялись
             cmd = ["aplay", "-q", "-f", "S16_LE", "-r", str(self.target_rate),
                    "-c", "1", "-t", "wav"]
         return self._run_external_player(cmd, path, timeout)
@@ -654,22 +631,13 @@ class AudioPlayer:
         except ImportError:  # pragma: no cover
             return False, "winsound недоступен"
         try:
-            # SND_FILENAME — синхронно: звук доигрывает до конца (без SND_ASYNC,
-            # который обрывал предыдущую фразу)
             winsound.PlaySound(path, winsound.SND_FILENAME)
             return True, ""
         except RuntimeError as e:
             return False, str(e)
 
     def _run_external_player(self, cmd, path, timeout):
-        """Запускает внешний плеер и ЖДЁТ завершения.
-
-        Ожидание обязательно: плееры вроде ffplay/paplay при немедленном
-        возврате управления не успевают опустошить кольцевой буфер звуковой
-        карты, и концовка фразы обрезается. stderr больше не подавляется
-        (``DEVNULL`` скрывал «Rate 24000Hz not supported» у aplay) — причина
-        сбоя попадает в лог клиента, а управление переходит к следующему плееру.
-        """
+        """Запускает внешний плеер и ЖДЁТ завершения."""
         full = cmd + [path]
         kwargs = {}
         if os.name == "nt":
@@ -712,7 +680,6 @@ class AudioPlayer:
 
     @staticmethod
     def _cleanup(path, seconds):
-        # файл нужен плееру до конца воспроизведения, поэтому удаляем с задержкой
         delay = max(2.0, float(seconds) + 2.0)
 
         def _remove():
@@ -727,6 +694,7 @@ class AudioPlayer:
 
 
 # ---------- АУДИО: глобальный плеер и прежний API ----------
+
 _PLAYER = None
 _PLAYER_LOCK = threading.Lock()
 
@@ -742,7 +710,7 @@ def audio_player(player_cmd=None, target_rate=TARGET_SAMPLE_RATE, interrupt=Fals
         else:
             _PLAYER.player_cmd = player_cmd or _PLAYER.player_cmd
             _PLAYER.interrupt = interrupt
-        return _PLAYER.start()
+    return _PLAYER.start()
 
 
 def stop_audio():
@@ -753,12 +721,7 @@ def stop_audio():
 
 
 def play_wav_bytes(data, player_cmd=None, wait=3.0, **kwargs):
-    """Воспроизведение WAV из памяти. Возвращает True, если звук запущен.
-
-    Совместимость со старым API сохранена, но воспроизведение теперь идёт через
-    очередь (:class:`AudioPlayer`): звук доигрывается до конца, не обрывается
-    следующей командой и приводится к формату, который понимает звуковая карта.
-    """
+    """Воспроизведение WAV из памяти. Возвращает True, если звук запущен."""
     if not data:
         return False
     if not player_candidates(player_cmd):
@@ -779,6 +742,7 @@ def _cleanup_later(path, delay=30.0):
             os.remove(path)
         except OSError:
             pass
+
     t = threading.Timer(delay, _rm)
     t.daemon = True
     t.start()
@@ -793,12 +757,12 @@ def decode_audio_b64(audio_b64):
 
 
 # ---------- КОМАНДЫ ----------
+
 def handle_command(msg, play=True, player_cmd=None):
     """Обрабатывает одну команду от сервера. Возвращает описание действия."""
     action = msg.get("action")
     audio_b64 = msg.get("audio_b64")
     played = False
-
     if action in ("greet", "speak"):
         if action == "greet":
             text = msg.get("text") or f"Здравствуйте, {msg.get('name', 'гость')}!"
@@ -819,25 +783,21 @@ def handle_command(msg, play=True, player_cmd=None):
         elif audio_b64 and not play:
             log.info("Воспроизведение отключено (--no-audio)")
         elif not audio_b64:
-            # Сервер больше не присылает пустых команд для объявлений, но
-            # приветствие без озвучки возможно, если TTS на сервере недоступен.
             log.info("Команда без аудио — озвучка на сервере недоступна/ещё готовится")
         return {"action": action, "name": msg.get("name"), "text": text, "played": played}
-
     if action == "stop":
         stop_audio()
         log.info("Воспроизведение остановлено по команде сервера")
         return {"action": action, "stopped": True}
-
     if action == "ping":
         log.info("Пинг от сервера: %s", msg.get("text") or "")
         return {"action": action, "pong": True}
-
     log.info("Получена команда: %s", msg)
     return {"action": action}
 
 
 # ---------- ПОТОК ДЛЯ ПРИЁМА КОМАНД ----------
+
 def command_listener(args, stop_event=None):
     context = zmq.Context()
     sub_socket = context.socket(zmq.SUB)
@@ -846,7 +806,6 @@ def command_listener(args, stop_event=None):
     sub_socket.setsockopt_string(zmq.SUBSCRIBE, args.client_id)
     sub_socket.setsockopt(zmq.RCVTIMEO, 300)
     log.info("Подписан на команды для %s", args.client_id)
-
     while not (stop_event and stop_event.is_set()):
         try:
             _topic = sub_socket.recv_string()
@@ -868,6 +827,7 @@ def command_listener(args, stop_event=None):
 
 
 # ---------- ВИДЕО ----------
+
 def prepare_frame(frame, max_width=0):
     """Уменьшает кадр, если задано --max-width. Возвращает (кадр, (w, h))."""
     h, w = frame.shape[:2]
@@ -885,10 +845,7 @@ def encode_jpeg(frame, quality=80):
 
 
 def save_jpeg(path, frame, quality=90):
-    """Сохраняет кадр кроссплатформенно (cv2.imwrite молча ломается на кириллице).
-
-    Возвращает True, если файл действительно записан и непустой.
-    """
+    """Сохраняет кадр кроссплатформенно."""
     data = encode_jpeg(frame, quality)
     if not data:
         log.error("Не удалось закодировать кадр для сохранения")
@@ -925,14 +882,53 @@ def build_meta(args, width, height, sent_frames=0, fps_actual=0.0):
     }
 
 
+def _is_capture_device(video_name):
+    """True, если /sys говорит, что это устройство захвата, а не метаданных."""
+    sys_path = f"/sys/class/video4linux/{video_name}/device"
+    return os.path.isdir(sys_path)
+
+
+def _device_caps(video_name):
+    """Прочитать capabilities V4L2-устройства из /sys (если возможно)."""
+    caps_path = f"/sys/class/video4linux/{video_name}/device/capabilities"
+    try:
+        with open(caps_path, "r") as f:
+            return f.read().strip()
+    except (OSError, ValueError):
+        return ""
+
+
 def video_devices():
-    """Список /dev/video* (Linux), отсортированный по номеру устройства."""
+    """Список /dev/video* (Linux), отсортированный по номеру устройства.
+
+    Предпочтение отдаётся устройствам, которые являются реальными захватчиками
+    (имеют /sys/class/video4linux/videoN/device/), а не узлами метаданных.
+    Если фильтрация через /sys невозможна — возвращаются все найденные.
+    """
     def num(path):
         m = re.search(r"(\d+)$", path)
         return int(m.group(1)) if m else 0
+
     if sys.platform == "win32":
         return []
-    return sorted(glob.glob("/dev/video*"), key=num)
+
+    devices = sorted(glob.glob("/dev/video*"), key=num)
+    if not devices:
+        return []
+
+    # Разделяем на реальные устройства захвата и метаданные
+    capture, metadata = [], []
+    for dev in devices:
+        name = os.path.basename(dev)
+        if _is_capture_device(name):
+            capture.append(dev)
+        else:
+            metadata.append(dev)
+
+    # Если удалось найти реальные устройства захвата — идём по ним первыми,
+    # но метаданные тоже пробуем (на случай, если /sys неполный)
+    ordered = capture + metadata
+    return ordered if ordered else devices
 
 
 def windows_camera_devices(max_index=10):
@@ -962,22 +958,61 @@ def autodetect_camera(max_index=10):
 
     Многие веб-камеры создают несколько узлов (/dev/video0 — захват,
     /dev/video1 — метаданные и т.д.), поэтому «камера 0» не всегда рабочая.
+
     Возвращает (источник, открытый VideoCapture) или (None, None).
     """
     candidates = list(video_devices())
     candidates += [i for i in range(max_index)
                    if f"/dev/video{i}" not in candidates]
+
     for source in candidates:
         cap = try_open_capture(source)
         if cap is not None:
             log.info("📷 Камера определена автоматически: %s", source)
             return source, cap
         log.info("Камера %s: недоступна или не читает кадры — пробую следующую", source)
+
+    # --- Диагностика при неудаче ---
+    if sys.platform != "win32":
+        dev_video = sorted(glob.glob("/dev/video*"))
+        if not dev_video:
+            log.warning("В контейнере нет устройств /dev/video* — камера хоста "
+                        "не проброшена.")
+            if _in_docker():
+                log.warning("Похоже, клиент работает в Docker на хосте с Windows.")
+                log.warning("Для проброса камеры в WSL2/Docker на хосте с Windows:")
+                log.warning("  1. Установите на хосте:  winget install usbipd")
+                log.warning("  2. Найдите камеру:       usbipd list")
+                log.warning("  3. Привяжите к WSL2:     usbipd attach --wsl --busid <busid>")
+                log.warning("  4. Проверьте:            docker compose --profile client exec client ls /dev/video*")
+                log.warning("  5. Перезапустите клиент: docker compose --profile client up -d client")
+                log.warning("Альтернатива: запустите клиент нативно на хосте: run-client.bat")
+        else:
+            log.warning("Устройства %s найдены, но ни одно не читает кадры. "
+                        "Проверьте права (группа video) и не занята ли камера "
+                        "другим приложением.", ", ".join(dev_video))
+    else:
+        log.warning("Проверьте: Диспетчер устройств → камеры, права на камеру "
+                    "в Windows (Параметры → Конфиденциальность → Камера), "
+                    "не занята ли камера другим приложением")
+
     return None, None
 
 
+def _in_docker():
+    """Эвристика: клиент работает внутри контейнера."""
+    if os.path.exists("/.dockerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup", "r") as f:
+            return "docker" in f.read() or "kubepods" in f.read()
+    except (OSError, ValueError):
+        return False
+
+
 def open_capture(args):
-    """Открывает камеру (--camera-id auto|индекс|путь) или видеофайл/поток."""
+    """Открывает камеру (--camera-device / --camera-id auto|индекс|путь)
+    или видеофайл/поток."""
     if args.video_source:
         cap = cv2.VideoCapture(args.video_source)
         if not cap.isOpened():
@@ -985,6 +1020,11 @@ def open_capture(args):
             return None
         args.resolved_source = args.video_source
         return cap
+
+    # CAMERA_DEVICE имеет приоритет над CAMERA_ID
+    camera_device = getattr(args, "camera_device", None)
+    if camera_device:
+        args.camera_id = camera_device
 
     cam = str(getattr(args, "camera_id", "auto") or "auto").strip()
     if cam.lower() in ("auto", "-1", ""):
@@ -1008,11 +1048,17 @@ def open_capture(args):
         source = int(cam)
     except ValueError:
         source = cam          # путь устройства, например /dev/video2
+
     cap = try_open_capture(source)
     if cap is None:
         log.error("Не удалось открыть камеру: %s", source)
         log.error("Проверьте: существует ли устройство, права (группа video), "
                   "или запустите с CAMERA_ID=auto для автопоиска")
+        if _in_docker() and not os.path.exists(str(source)):
+            log.error("Устройство %s не существует в контейнере. "
+                      "На хосте с Windows камера не проброшена — используйте "
+                      "usbipd attach --wsl --busid <busid> или запустите клиент "
+                      "нативно (run-client.bat).", source)
         return None
     args.camera_id = source
     args.resolved_source = source
@@ -1040,6 +1086,10 @@ def list_cameras(count=10):
             log.info("Камера %s: недоступна", source)
     if not found:
         log.warning("Ни одной рабочей камеры не найдено")
+        if sys.platform != "win32" and _in_docker():
+            log.warning("В Docker на хосте с Windows камеры не пробрасываются "
+                        "автоматически. См. инструкцию в комментарии выше "
+                        "или запустите клиент нативно: run-client.bat")
     return found
 
 
@@ -1058,11 +1108,11 @@ def check_audio(args):
         print(f"  ALSA (/dev/snd):      {'есть' if alsa_available() else 'нет'}")
     print(f"  Целевая частота:      {args.audio_rate} Гц")
     if not player:
-        print(f"\n  ✗ Плеер не найден. {player_hint()}")
+        print(f"\n✗ Плеер не найден. {player_hint()}")
         print("=" * 72)
         return 1
     tone = test_tone_wav(rate=int(args.audio_rate))
-    print("\n  ▶ Играю тестовый сигнал 0.6 с (440 Гц)…")
+    print("\n▶ Играю тестовый сигнал 0.6 с (440 Гц)…")
     ok = play_wav_bytes(tone, args.audio_player, wait=10.0)
     time.sleep(1.2)
     print(f"  Результат:            {'успешно' if ok else 'ОШИБКА (см. лог выше)'}")
@@ -1085,6 +1135,7 @@ def draw_hud(frame, client_id, fps_actual, server, show_status=True):
 
 
 # ---------- ОСНОВНОЙ ПОТОК ОТПРАВКИ ВИДЕО ----------
+
 def start_client(args):
     stop_event = threading.Event()
 
@@ -1101,12 +1152,10 @@ def start_client(args):
     if args.list_cameras:
         list_cameras()
         return 0
-
     if args.check_audio:
         return check_audio(args)
 
-    # Звуковой тракт готовим сразу: ошибки плеера видны в первом же сообщении,
-    # а не в момент первого приветствия.
+    # Звуковой тракт готовим сразу
     if not args.no_audio:
         player = resolve_player(args.audio_player)
         if player is None:
@@ -1187,12 +1236,12 @@ def start_client(args):
                     video_socket.send_string(args.client_id, flags=zmq.SNDMORE)
                     video_socket.send(payload)
                 sent += 1
+
                 dt = now - last_send
                 last_send = now
                 if dt > 0:
                     fps_actual = (0.9 * fps_actual + 0.1 * min(1.0 / dt, 200.0)) if fps_actual else min(1.0 / dt, 200.0)
 
-            # досыпаем остаток интервала, чтобы не грузить CPU
             elapsed = time.time() - last_send
             if elapsed < send_interval:
                 time.sleep(send_interval - elapsed)
@@ -1208,9 +1257,10 @@ def start_client(args):
         except Exception:  # noqa: BLE001
             pass
         cv2.destroyAllWindows()
-        stats = audio_player().describe()["stats"] if _PLAYER is not None else {}
-        log.info("Отправлено кадров: %d%s", sent,
-                 f" | звук: {stats}" if stats else "")
+
+    stats = audio_player().describe()["stats"] if _PLAYER is not None else {}
+    log.info("Отправлено кадров: %d%s", sent,
+             f" | звук: {stats}" if stats else "")
     return 0
 
 
