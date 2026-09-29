@@ -26,7 +26,6 @@ if exist "%VENV_DIR%\Scripts\python.exe" (
     exit /b 1
   )
   set "PY=python"
-  echo >>> ВНИМАНИЕ: окружение %VENV_DIR% не найдено - запуск системным Python.
   echo     Установите зависимости: install.bat
 )
 
